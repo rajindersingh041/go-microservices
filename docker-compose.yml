@@ -1,0 +1,55 @@
+# 'version' is obsolete and can be removed
+services:
+  # --- Postgres Service (Unchanged) ---
+  postgres:
+    image: postgres:latest
+    container_name: postgres-db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=mydatabase
+      - POSTGRES_USER=myuser
+      - POSTGRES_PASSWORD=mypassword
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d mydatabase"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Ingestion Service (Cleaned) ---
+  ingestion-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ingestion-service
+    ports:
+      - "8080:8080"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=myuser
+      - POSTGRES_PASSWORD=mypassword
+      - POSTGRES_DB=mydatabase
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # This command runs the binary we built into the image
+    command: /bin/ingestion-service
+
+  # --- Query Service (Cleaned) ---
+  query-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: query-service
+    ports:
+      - "8081:8081"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=myuser
+      - POSTGRES_PASSWORD=mypassword
+      - POSTGRES_DB=mydatabase
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # This command runs the other binary
+    command: /bin/query-service
