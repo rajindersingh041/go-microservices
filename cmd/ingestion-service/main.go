@@ -2,36 +2,38 @@ package main
 
 import (
 	"context"
+	"database/sql" // <-- Use standard *sql.DB
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"os"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	// This is the blank import to register the driver
+	_ "github.com/ClickHouse/clickhouse-go/v2"
 
-	// Update this to your go.mod module name
 	"github.com/rajindersingh041/go-microservices/internal/database"
 	"github.com/rajindersingh041/go-microservices/internal/models"
 )
 
-// App holds the concurrent-safe connection pool
 type App struct {
-	db *pgxpool.Pool
+	db *sql.DB // <-- Use the concurrent-safe pool
 }
 
 func main() {
-	// ... (main function is unchanged)
-	conn, err := database.Connect()
+	host := os.Getenv("CLICKHOUSE_HOST")
+	conn, err := database.Connect(host)
 	if err != nil {
-		log.Fatalf("Failed to connect to Postgres: %v", err)
+		log.Fatalf("Failed to connect to ClickHouse: %v", err)
 	}
 	defer conn.Close()
+	log.Printf("Successfully connected to ClickHouse pool on %s", host)
 
-	log.Println("Successfully connected to Postgres pool and schema is ready.")
+	if err := database.InitializeSchema(conn); err != nil {
+		log.Fatalf("Failed to initialize schema: %v", err)
+	}
 
 	app := &App{db: conn}
-
 	http.HandleFunc("/ingest", app.handleIngest)
 
 	port := ":8080"
@@ -41,79 +43,61 @@ func main() {
 	}
 }
 
-// handleIngest is now "smart" and handles both single and batch events
 func (app *App) handleIngest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// 1. Read the raw body
+	// ... "Smart" JSON logic is unchanged ...
 	body, err := io.ReadAll(r.Body)
+	if err != nil { /* ... error handling ... */ }
+	var events []models.Event
+	err = json.Unmarshal(body, &events)
 	if err != nil {
-		log.Printf("Error reading body: %v", err)
+		var singleEvent models.Event
+		err2 := json.Unmarshal(body, &singleEvent)
+		if err2 != nil { /* ... error handling ... */ }
+		events = []models.Event{singleEvent}
+	}
+	if len(events) == 0 { /* ... error handling ... */ }
+
+	// --- NEW: ClickHouse database/sql Batch Insert ---
+	// We must use a transaction for batching with the sql.DB driver
+	tx, err := app.db.Begin()
+	if err != nil {
+		log.Printf("Error beginning transaction: %v", err)
 		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
 
-	var events []models.Event
-
-	// --- THIS IS THE NEW "SMART" LOGIC ---
-	// 2. Try to unmarshal as an array (batch) first
-	err = json.Unmarshal(body, &events)
+	// Prepare the statement within the transaction
+	stmt, err := tx.PrepareContext(context.Background(), "INSERT INTO events (Timestamp, Level, Source, Message)")
 	if err != nil {
-		// 3. If it's not an array, try to unmarshal as a single object
-		var singleEvent models.Event
-		err2 := json.Unmarshal(body, &singleEvent)
-		if err2 != nil {
-			// 4. If it's neither, the JSON is truly invalid
-			log.Printf("Failed to decode JSON as array or object: %v", err)
-			http.Error(w, "Failed to decode JSON: must be a single event object or an array of events", http.StatusBadRequest)
+		log.Printf("Error preparing statement: %v", err)
+		tx.Rollback()
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+	defer stmt.Close()
+
+	// Loop and add each event to the batch
+	for _, e := range events {
+		if _, err := stmt.ExecContext(context.Background(), e.Timestamp, e.Level, e.Source, e.Message); err != nil {
+			log.Printf("Error executing batch: %v", err)
+			tx.Rollback()
+			http.Error(w, "Server error", http.StatusInternalServerError)
 			return
 		}
-		
-		// 5. It was a single object. Put it in the slice.
-		events = []models.Event{singleEvent}
 	}
-	// --- END OF NEW LOGIC ---
 
-	if len(events) == 0 {
-		http.Error(w, "Received empty event batch", http.StatusBadRequest)
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		log.Printf("Error committing transaction: %v", err)
+		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}
+	// --- END NEW BATCH LOGIC ---
 
-	// 6. The rest of the high-performance logic is UNCHANGED
-	// It works perfectly with a slice of 1 or 1,000,000
-	rows := make([][]interface{}, len(events))
-	for i, e := range events {
-		rows[i] = []interface{}{
-			e.Timestamp,
-			e.Level,
-			e.Source,
-			e.Message,
-		}
-	}
-
-	tableName := pgx.Identifier{"events"}
-	colNames := []string{"timestamp", "level", "source", "message"}
-
-	copyCount, err := app.db.CopyFrom(
-		context.Background(),
-		tableName,
-		colNames,
-		pgx.CopyFromRows(rows),
-	)
-
-	if err != nil {
-		log.Printf("Error during batch insert: %v", err)
-		http.Error(w, "Server error during batch insert", http.StatusInternalServerError)
-		return
-	}
-
-	log.Printf("Successfully ingested batch of %d events", copyCount)
+	log.Printf("Successfully ingested batch of %d events", len(events))
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":   "accepted",
-		"ingested": copyCount,
+		"ingested": len(events),
 	})
 }

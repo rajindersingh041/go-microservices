@@ -2,38 +2,35 @@ package main
 
 import (
 	"context"
+	"database/sql" // <-- Use standard *sql.DB
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	// This is the blank import to register the driver
+	_ "github.com/ClickHouse/clickhouse-go/v2"
 
 	// Update this to your go.mod module name
 	"github.com/rajindersingh041/go-microservices/internal/database"
 	"github.com/rajindersingh041/go-microservices/internal/models"
 )
 
-// App holds the concurrent-safe connection pool
 type App struct {
-	db *pgxpool.Pool
+	db *sql.DB // <-- Use the concurrent-safe pool
 }
 
-// Includes the fix: func main()
 func main() {
-	// Connect to Postgres pool (also runs init sql)
-	conn, err := database.Connect()
+    // ... (This is all correct) ...
+	host := os.Getenv("CLICKHOUSE_HOST")
+	conn, err := database.Connect(host)
 	if err != nil {
-		log.Fatalf("Failed to connect to Postgres: %v", err)
+		log.Fatalf("Failed to connect to ClickHouse: %v", err)
 	}
-	defer conn.Close() // Closes the pool on shutdown
-
-	log.Println("Successfully connected to Postgres pool and schema is ready.")
-
+	defer conn.Close()
+	log.Printf("Successfully connected to ClickHouse pool on %s", host)
 	app := &App{db: conn}
-
 	http.HandleFunc("/query", app.handleQuery)
-
 	port := ":8081"
 	log.Printf("Starting query service on port %s...", port)
 	if err := http.ListenAndServe(port, nil); err != nil {
@@ -47,10 +44,12 @@ func (app *App) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- THIS IS THE FIX ---
+	// Change all column names to match the case in the CREATE TABLE command
 	query := "SELECT Timestamp, Level, Source, Message FROM events ORDER BY Timestamp DESC LIMIT 10"
+	// --- END OF FIX ---
 
-	// app.db.Query() is concurrency-safe
-	rows, err := app.db.Query(context.Background(), query)
+	rows, err := app.db.QueryContext(context.Background(), query)
 	if err != nil {
 		log.Printf("Error executing query: %v", err)
 		http.Error(w, "Server error", http.StatusInternalServerError)
@@ -58,11 +57,25 @@ func (app *App) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	// working now, earlier wasnot working
-	events, err := pgx.CollectRows[models.Event](rows, pgx.RowToStructByName[models.Event])
-		
-	if err != nil {
-		log.Printf("Error scanning rows: %v", err)
+	var events []models.Event
+	for rows.Next() {
+		var event models.Event
+		// The Scan order must match the SELECT
+		if err := rows.Scan(
+			&event.Timestamp,
+			&event.Level,
+			&event.Source,
+			&event.Message,
+		); err != nil {
+			log.Printf("Error scanning row: %v", err)
+			http.Error(w, "Server error", http.StatusInternalServerError)
+			return
+		}
+		events = append(events, event)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("Error after row iteration: %v", err)
 		http.Error(w, "Server error", http.StatusInternalServerError)
 		return
 	}

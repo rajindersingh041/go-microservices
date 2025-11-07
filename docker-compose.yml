@@ -1,22 +1,32 @@
-# 'version' is obsolete and can be removed
 services:
-  # --- Postgres Service (Unchanged) ---
-  postgres:
-    image: postgres:latest
-    container_name: postgres-db
+  # --- CLICKHOUSE DATABASE ---
+  clickhouse-server:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse-server
     ports:
-      - "5432:5432"
+      - "8123:8123" # HTTP port
+      - "9000:9000" # Native client port
     environment:
-      - POSTGRES_DB=mydatabase
-      - POSTGRES_USER=myuser
-      - POSTGRES_PASSWORD=mypassword
+      - CLICKHOUSE_DB=mydatabase
+      - CLICKHOUSE_USER=myuser
+      - CLICKHOUSE_PASSWORD=mypassword
+      - CLICKHOUSE_DEFAULT_DATABASE=mydatabase
+    
+    # --- THIS IS THE NEW, RELIABLE HEALTHCHECK ---
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d mydatabase"]
+      test: ["CMD", "clickhouse-client", "-u", "myuser", "--password", "mypassword", "--query", "SELECT 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s # Keep this to give it time to boot
+    # --- END OF FIX ---
 
-  # --- Ingestion Service (Cleaned) ---
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # --- Ingestion Service (Unchanged) ---
   ingestion-service:
     build:
       context: .
@@ -25,17 +35,16 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_USER=myuser
-      - POSTGRES_PASSWORD=mypassword
-      - POSTGRES_DB=mydatabase
+      - CLICKHOUSE_HOST=clickhouse-server
+      - CLICKHOUSE_USER=myuser
+      - CLICKHOUSE_PASSWORD=mypassword
+      - CLICKHOUSE_DB=mydatabase
     depends_on:
-      postgres:
+      clickhouse-server:
         condition: service_healthy
-    # This command runs the binary we built into the image
     command: /bin/ingestion-service
 
-  # --- Query Service (Cleaned) ---
+  # --- Query Service (Unchanged) ---
   query-service:
     build:
       context: .
@@ -44,12 +53,11 @@ services:
     ports:
       - "8081:8081"
     environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_USER=myuser
-      - POSTGRES_PASSWORD=mypassword
-      - POSTGRES_DB=mydatabase
+      - CLICKHOUSE_HOST=clickhouse-server
+      - CLICKHOUSE_USER=myuser
+      - CLICKHOUSE_PASSWORD=mypassword
+      - CLICKHOUSE_DB=mydatabase
     depends_on:
-      postgres:
+      clickhouse-server:
         condition: service_healthy
-    # This command runs the other binary
     command: /bin/query-service
