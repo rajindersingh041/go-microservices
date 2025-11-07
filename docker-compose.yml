@@ -1,55 +1,116 @@
-# 'version' is obsolete and can be removed
 services:
-  # --- Postgres Service (Unchanged) ---
-  postgres:
-    image: postgres:latest
-    container_name: postgres-db
+  # --- CLICKHOUSE DATABASE ---
+  clickhouse-server:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse-server
     ports:
-      - "5432:5432"
+      - "8123:8123"
+      - "9000:9000"
+    
+    # --- THIS BLOCK WAS MISSING OR WRONG ---
+    # These variables configure the database container itself.
     environment:
-      - POSTGRES_DB=mydatabase
-      - POSTGRES_USER=myuser
-      - POSTGRES_PASSWORD=mypassword
+      - CLICKHOUSE_DB=mydatabase
+      - CLICKHOUSE_USER=myuser
+      - CLICKHOUSE_PASSWORD=mypassword
+      - CLICKHOUSE_DEFAULT_DATABASE=mydatabase
+    # --- END OF FIX ---
+
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d mydatabase"]
+      test: ["CMD", "clickhouse-client", "-u", "myuser", "--password", "mypassword", "--query", "SELECT 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-
-  # --- Ingestion Service (Cleaned) ---
-  ingestion-service:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: ingestion-service
-    ports:
-      - "8080:8080"
-    environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_USER=myuser
-      - POSTGRES_PASSWORD=mypassword
-      - POSTGRES_DB=mydatabase
+      start_period: 10s
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+# --- INGESTION SERVICES ---
+  ingest-events:
+    build: .
+    command: /bin/ingest-events
+    ports: [ "8080:8080" ]
+    env_file: [ ".env" ]
     depends_on:
-      postgres:
-        condition: service_healthy
-    # This command runs the binary we built into the image
-    command: /bin/ingestion-service
+      clickhouse-server: { condition: service_healthy }
+    healthcheck: &http_healthcheck # <-- This is the anchor
+      # --- THIS IS THE FIX ---
+      test: ["CMD", "curl", "http://localhost:8080"] # Removed the '-f'
+      # --- END OF FIX ---
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
-  # --- Query Service (Cleaned) ---
-  query-service:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: query-service
-    ports:
-      - "8081:8081"
-    environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_USER=myuser
-      - POSTGRES_PASSWORD=mypassword
-      - POSTGRES_DB=mydatabase
+  ingest-marketdata:
+    build: .
+    command: /bin/ingest-marketdata
+    ports: [ "8081:8081" ]
+    env_file: [ ".env" ]
     depends_on:
-      postgres:
-        condition: service_healthy
-    # This command runs the other binary
-    command: /bin/query-service
+      clickhouse-server: { condition: service_healthy }
+    healthcheck:
+      <<: *http_healthcheck # <-- Re-uses the fixed check
+      test: ["CMD", "curl", "http://localhost:8081"] # <-- Just change the port
+
+  # --- QUERY SERVICES ---
+  query-events:
+    build: .
+    command: /bin/query-events
+    ports: [ "8090:8090" ]
+    env_file: [ ".env" ]
+    depends_on:
+      clickhouse-server: { condition: service_healthy }
+    healthcheck:
+      <<: *http_healthcheck # <-- Re-uses the fixed check
+      test: ["CMD", "curl", "http://localhost:8090"] # <-- Just change the port
+
+  query-marketdata:
+    build: .
+    command: /bin/query-marketdata
+    ports: [ "8091:8091" ]
+    env_file: [ ".env" ]
+    depends_on:
+      clickhouse-server: { condition: service_healthy }
+    healthcheck:
+      <<: *http_healthcheck # <-- Re-uses the fixed check
+      test: ["CMD", "curl", "http://localhost:8091"] # <-- Just change the port
+
+  # --- POLLER SERVICE (Unchanged) ---
+  market-poller:
+    build: .
+    command: /bin/market-poller
+    env_file: [ ".env" ]
+    depends_on:
+      clickhouse-server: { condition: service_healthy }
+      ingest-events: { condition: service_healthy }
+      ingest-marketdata: { condition: service_healthy }
+
+
+  internal-transformer:
+      build: .
+      command: /bin/internal-transformer
+      env_file: [ ".env" ]
+      depends_on:
+        # It needs the source and destination to be healthy
+        query-marketdata:
+          condition: service_healthy
+        ingest-events:
+          condition: service_healthy
+
+
+  on-demand-fetcher:
+      build: .
+      command: /bin/on-demand-fetcher
+      ports:
+        - "8079:8079" # <-- New port
+      env_file: [ ".env" ]
+      depends_on:
+        clickhouse-server: { condition: service_healthy }
+        ingest-events: { condition: service_healthy }
+        ingest-marketdata: { condition: service_healthy }
+      healthcheck:
+        test: ["CMD", "curl", "http://localhost:8079"]
+        interval: 10s
+        timeout: 5s
+        retries: 3
+        start_period: 5s
