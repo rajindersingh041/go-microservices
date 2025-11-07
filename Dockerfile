@@ -1,30 +1,27 @@
 # ---- Build Stage ----
-# Use the official Go image as the builder
 FROM golang:1.25-alpine AS builder
-
 WORKDIR /app
-
-# Copy module files and download dependencies
-# This is done first to leverage Docker layer caching
 COPY go.mod go.sum ./
 RUN go mod download
-
-# Copy the rest of the source code
 COPY . .
-
-# Build both service binaries
-RUN CGO_ENABLED=0 go build -o /bin/ingestion-service ./cmd/ingestion-service/main.go
-RUN CGO_ENABLED=0 go build -o /bin/query-service ./cmd/query-service/main.go
+# --- BUILD ALL BINARIES ---
+RUN CGO_ENABLED=0 go build -o /bin/ingest-events        ./cmd/ingest-events/main.go
+RUN CGO_ENABLED=0 go build -o /bin/ingest-marketdata    ./cmd/ingest-marketdata/main.go
+RUN CGO_ENABLED=0 go build -o /bin/query-events         ./cmd/query-events/main.go
+RUN CGO_ENABLED=0 go build -o /bin/query-marketdata     ./cmd/query-marketdata/main.go
+RUN CGO_ENABLED=0 go build -o /bin/market-poller        ./cmd/market-poller/main.go
+RUN CGO_ENABLED=0 go build -o /bin/internal-transformer ./cmd/internal-transformer/main.go
+RUN CGO_ENABLED=0 go build -o /bin/on-demand-fetcher    ./cmd/on-demand-fetcher/main.go
 
 # ---- Final Stage ----
-# Use a minimal Alpine image for the final container
 FROM alpine:latest
+RUN apk --no-cache add ca-certificates tzdata curl
 
-# Add certificates for any potential outbound HTTPS calls
-RUN apk --no-cache add ca-certificates
-
-# Copy *only* the compiled binaries from the builder stage
-COPY --from=builder /bin/ingestion-service /bin/ingestion-service
-COPY --from=builder /bin/query-service /bin/query-service
-
-# We will specify the command to run in docker-compose.yml
+# --- COPY ALL BINARIES ---
+COPY --from=builder /bin/ingest-events        /bin/ingest-events
+COPY --from=builder /bin/ingest-marketdata    /bin/ingest-marketdata
+COPY --from=builder /bin/query-events         /bin/query-events
+COPY --from=builder /bin/query-marketdata     /bin/query-marketdata
+COPY --from=builder /bin/market-poller        /bin/market-poller
+COPY --from=builder /bin/internal-transformer /bin/internal-transformer
+COPY --from=builder /bin/on-demand-fetcher    /bin/on-demand-fetcher
