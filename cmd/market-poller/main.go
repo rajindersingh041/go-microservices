@@ -15,17 +15,45 @@ import (
 	"github.com/rajindersingh041/go-microservices/internal/models"
 )
 
-// Config holds all config from environment variables
+/*
+MARKET POLLER - BACKGROUND MICROSERVICE
+=======================================
+Purpose: This is a background service that periodically fetches market data from external APIs
+and forwards it to the ingestion services.
+
+Background Service Pattern:
+- No HTTP endpoints (doesn't serve requests)
+- Runs on a schedule/timer
+- Orchestrates communication between external APIs and internal services
+- Acts as a data pipeline component
+
+Microservices Architecture Benefits:
+1. SEPARATION OF CONCERNS: Data fetching logic separate from storage logic
+2. RESILIENCE: If poller fails, ingestion services still work for manual data
+3. SCALABILITY: Can run multiple pollers for different markets/timeframes
+4. MAINTAINABILITY: Changes to external API only affect this service
+
+Service Communication Pattern:
+External API → Market Poller → Ingestion Services → Database
+
+This demonstrates:
+- Service-to-service communication via HTTP
+- Event-driven architecture (polling external events)
+- Circuit breaker pattern (market hours checking)
+*/
+
+// Config holds all configuration loaded from environment variables
+// Centralized configuration makes the service configurable across environments
 type Config struct {
-	Instruments       []string
-	UpstoxURL         string
-	IngestMarketURL   string // Renamed
-	IngestEventsURL   string // New
-	Interval          time.Duration
-	Loc               *time.Location
-	StartTime         time.Time
-	EndTime           time.Time
-	HttpClient        *http.Client
+	Instruments       []string      // Financial instruments to fetch (stocks, bonds, etc.)
+	UpstoxURL         string        // External market data API endpoint
+	IngestMarketURL   string        // Internal market data ingestion service URL
+	IngestEventsURL   string        // Internal events ingestion service URL
+	Interval          time.Duration // How often to poll external API
+	Loc               *time.Location // Timezone for market hours calculation
+	StartTime         time.Time     // Market opening time
+	EndTime           time.Time     // Market closing time
+	HttpClient        *http.Client  // Reusable HTTP client with timeout
 }
 
 // loadConfig loads and parses all config from env

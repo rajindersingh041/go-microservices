@@ -12,74 +12,119 @@ import (
 
 	_ "github.com/ClickHouse/clickhouse-go/v2"
 
-	// Make sure this matches your go.mod
 	"github.com/rajindersingh041/go-microservices/internal/database"
 	"github.com/rajindersingh041/go-microservices/internal/models"
 )
 
-// This service OWNS the 'market_data' table
+/*
+MARKET DATA INGESTION MICROSERVICE
+=================================
+Purpose: This service handles the ingestion of real-time market data from external APIs.
+
+Domain Separation: This service is completely separate from events
+- Different data model (financial vs log data)
+- Different performance characteristics (high-frequency updates)
+- Different scaling requirements (market hours vs 24/7)
+- Independent development and deployment
+
+Financial Data Considerations:
+1. Time-series optimized storage (ClickHouse MergeTree)
+2. High-frequency updates during market hours
+3. Complex data structures (OHLC, volumes, open interest)
+4. Data integrity critical for trading decisions
+
+Scaling Strategies:
+1. Market Hours Scaling: Auto-scale during trading hours
+2. Symbol Partitioning: Separate services per market/exchange
+3. Real-time Streaming: Apache Kafka for high-throughput ingestion
+4. Data Deduplication: Handle duplicate market data from sources
+*/
+
+// Database Schema: Optimized for financial time-series data
+// ORDER BY (TokenName, Timestamp): Enables efficient queries by symbol and time
+// DateTime64(3): Millisecond precision for accurate trade timing
 const initMarketDataSQL = `
 CREATE TABLE IF NOT EXISTS mydatabase.market_data (
-    RequestID         String,
-    ResponseTime      DateTime64(3),
-    TokenName         String,
-    Timestamp         DateTime,
-    LastTradeTime     DateTime,
-    LastPrice         Float64,
-    ClosePrice        Float64,
-    LastQuantity      Int64,
-    BuyQuantity       Float64,
-    SellQuantity      Float64,
-    Volume            Int64,
-    AveragePrice      Float64,
-    Oi                Float64,
-    Poi               Float64,
-    OiDayHigh         Float64,
-    OiDayLow          Float64,
-    NetChange         Float64,
-    LowerCircuitLimit Float64,
-    UpperCircuitLimit Float64,
-    Yl                Float64,
-    Yh                Float64,
-    OhlcOpen          Float64,
-    OhlcHigh          Float64,
-    OhlcLow           Float64,
-    OhlcClose         Float64,
-    OhlcVolume        Int64
+    RequestID         String,           -- Unique identifier for API request
+    ResponseTime      DateTime64(3),    -- When data was received (millisecond precision)
+    TokenName         String,           -- Financial instrument identifier
+    Timestamp         DateTime,         -- Market data timestamp
+    LastTradeTime     DateTime,         -- When last trade occurred
+    LastPrice         Float64,          -- Current market price
+    ClosePrice        Float64,          -- Previous day's closing price
+    LastQuantity      Int64,            -- Quantity of last trade
+    BuyQuantity       Float64,          -- Total buy side quantity
+    SellQuantity      Float64,          -- Total sell side quantity
+    Volume            Int64,            -- Total volume traded
+    AveragePrice      Float64,          -- Volume-weighted average price
+    Oi                Float64,          -- Open Interest (derivatives)
+    Poi               Float64,          -- Previous Open Interest
+    OiDayHigh         Float64,          -- Day's highest open interest
+    OiDayLow          Float64,          -- Day's lowest open interest
+    NetChange         Float64,          -- Price change from previous close
+    LowerCircuitLimit Float64,          -- Lower price limit (regulatory)
+    UpperCircuitLimit Float64,          -- Upper price limit (regulatory)
+    Yl                Float64,          -- Year Low
+    Yh                Float64,          -- Year High
+    OhlcOpen          Float64,          -- Day's opening price
+    OhlcHigh          Float64,          -- Day's highest price
+    OhlcLow           Float64,          -- Day's lowest price
+    OhlcClose         Float64,          -- Current/last price
+    OhlcVolume        Int64             -- Day's total volume
 ) ENGINE = MergeTree()
-ORDER BY (TokenName, Timestamp);
+ORDER BY (TokenName, Timestamp);      -- Optimized for symbol-time queries
 `
 
+// App manages database connections and HTTP handlers for market data
 type App struct {
-	db *sql.DB
+	db *sql.DB // Connection pool for high-frequency market data inserts
 }
 
 func main() {
+	// Database Connection: Connect to ClickHouse for market data storage
+	// ClickHouse is ideal for financial data due to:
+	// - Columnar storage (efficient for analytical queries)
+	// - High compression (financial data has patterns)
+	// - Fast aggregations (OHLC calculations, volume analysis)
 	host := os.Getenv("CLICKHOUSE_HOST")
 	conn, err := database.Connect(host)
 	if err != nil {
-		log.Fatalf("Failed to connect: %v", err)
+		log.Fatalf("Failed to connect to ClickHouse: %v", err)
 	}
 	defer conn.Close()
 
-	// Initialize *this service's* schema
+	// Schema Ownership: This service owns the market_data table
+	// Database Per Service pattern: Each microservice manages its own data
+	// Benefits: Independent scaling, schema evolution, fault isolation
 	if _, err := conn.Exec(initMarketDataSQL); err != nil {
-		log.Fatalf("Failed to init 'market_data' schema: %v", err)
+		log.Fatalf("Failed to initialize market_data schema: %v", err)
 	}
-	log.Println("'market_data' table is ready.") // <-- You will see this log now
+	log.Println("Market data table initialized and ready for ingestion.")
 
+	// Application Initialization
 	app := &App{db: conn}
-	http.HandleFunc("/ingest/marketdata", app.handleIngest) // Define route
 	
-	port := ":8081" // Run on a different port
-	log.Printf("Starting market data ingestion service on %s...", port) // <-- And this one
+	// Route Setup: Define API endpoint for market data ingestion
+	// RESTful convention: POST /ingest/marketdata
+	http.HandleFunc("/ingest/marketdata", app.handleIngest)
 	
-	// --- THIS IS THE MISSING, CRITICAL LINE ---
-	// It blocks forever and runs the server.
+	// Service Port: Port 8081 dedicated to market data ingestion
+	// Port allocation strategy:
+	// - 8080-8089: Ingestion services
+	// - 8090-8099: Query services
+	// - 8100+: Background/utility services
+	port := ":8081"
+	log.Printf("Starting market data ingestion service on %s...", port)
+	
+	// HTTP Server: Start listening for market data API requests
+	// In production, add:
+	// - Graceful shutdown handling
+	// - Health check endpoints
+	// - Metrics collection
+	// - Request timeout configurations
 	if err := http.ListenAndServe(port, nil); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+		log.Fatalf("Failed to start HTTP server: %v", err)
 	}
-	// --- END OF FIX ---
 }
 func (app *App) handleIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
